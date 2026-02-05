@@ -53,6 +53,11 @@ SQL
     fi
 }
 
+# Escape single quotes for SQL
+sql_escape() {
+    echo "${1//\'/\'\'}"
+}
+
 # Log an audit event
 log_audit() {
     local action="$1"
@@ -60,7 +65,7 @@ log_audit() {
     local details="$3"
     local now=$(date +%s)
 
-    sqlite3 "$DB_PATH" "INSERT INTO audit_log (action, content_id, details, timestamp) VALUES ('$action', '$content_id', '$(echo "$details" | sed "s/'/''/g")', $now)"
+    sqlite3 "$DB_PATH" "INSERT INTO audit_log (action, content_id, details, timestamp) VALUES ('$(sql_escape "$action")', '$(sql_escape "$content_id")', '$(sql_escape "$details")', $now)"
 }
 
 # Mark content with source and trust level
@@ -90,14 +95,16 @@ cmd_mark_source() {
     esac
 
     local now=$(date +%s)
+    local esc_id=$(sql_escape "$id")
+    local esc_source=$(sql_escape "$source")
 
     # Check if ID already exists
-    local existing=$(sqlite3 "$DB_PATH" "SELECT id FROM content WHERE id = '$id' LIMIT 1")
+    local existing=$(sqlite3 "$DB_PATH" "SELECT id FROM content WHERE id = '$esc_id' LIMIT 1")
 
     if [ -n "$existing" ]; then
         # Update existing, append to custody chain
-        local old_chain=$(sqlite3 "$DB_PATH" "SELECT custody_chain FROM content WHERE id = '$id'")
-        local new_entry="{\"source\":\"$source\",\"trust\":\"$trust_level\",\"at\":$now}"
+        local old_chain=$(sqlite3 "$DB_PATH" "SELECT custody_chain FROM content WHERE id = '$esc_id'")
+        local new_entry="{\"source\":\"$esc_source\",\"trust\":\"$trust_level\",\"at\":$now}"
 
         # Append to chain (simple approach - works for JSON arrays)
         if [ "$old_chain" = "[]" ]; then
@@ -106,10 +113,10 @@ cmd_mark_source() {
             local new_chain="${old_chain%]}, $new_entry]"
         fi
 
-        sqlite3 "$DB_PATH" "UPDATE content SET source = '$source', trust_level = '$trust_level', marked_at = $now, custody_chain = '$(echo "$new_chain" | sed "s/'/''/g")' WHERE id = '$id'"
+        sqlite3 "$DB_PATH" "UPDATE content SET source = '$esc_source', trust_level = '$trust_level', marked_at = $now, custody_chain = '$(sql_escape "$new_chain")' WHERE id = '$esc_id'"
         echo "Updated provenance for '$id' (source: $source, trust: $trust_level)"
     else
-        sqlite3 "$DB_PATH" "INSERT INTO content (id, source, trust_level, marked_at, custody_chain) VALUES ('$id', '$source', '$trust_level', $now, '[{\"source\":\"$source\",\"trust\":\"$trust_level\",\"at\":$now}]')"
+        sqlite3 "$DB_PATH" "INSERT INTO content (id, source, trust_level, marked_at, custody_chain) VALUES ('$esc_id', '$esc_source', '$trust_level', $now, '[{\"source\":\"$esc_source\",\"trust\":\"$trust_level\",\"at\":$now}]')"
         echo "Marked provenance for '$id' (source: $source, trust: $trust_level)"
     fi
 
@@ -123,6 +130,7 @@ cmd_mark_source() {
 apply_policies() {
     local id="$1"
     local source="$2"
+    local esc_id=$(sql_escape "$id")
 
     # Get all policies and check for matches
     local policies=$(sqlite3 -separator '|' "$DB_PATH" "SELECT pattern, trust_level FROM policies")
@@ -132,7 +140,7 @@ apply_policies() {
 
         # Simple glob matching using bash
         if [[ "$source" == $pattern ]]; then
-            sqlite3 "$DB_PATH" "UPDATE content SET trust_level = '$trust' WHERE id = '$id'"
+            sqlite3 "$DB_PATH" "UPDATE content SET trust_level = '$trust' WHERE id = '$esc_id'"
             echo "  Applied policy: $pattern -> $trust"
             log_audit "policy_applied" "$id" "pattern=$pattern, trust=$trust"
             return
@@ -149,7 +157,8 @@ cmd_check_provenance() {
         return 1
     fi
 
-    local result=$(sqlite3 -separator '|' "$DB_PATH" "SELECT source, trust_level, datetime(marked_at, 'unixepoch'), custody_chain FROM content WHERE id = '$id'")
+    local esc_id=$(sql_escape "$id")
+    local result=$(sqlite3 -separator '|' "$DB_PATH" "SELECT source, trust_level, datetime(marked_at, 'unixepoch'), custody_chain FROM content WHERE id = '$esc_id'")
 
     if [ -z "$result" ]; then
         echo "No provenance record found for '$id'"
@@ -168,11 +177,11 @@ cmd_check_provenance() {
     echo "$custody_chain" | jq -r '.[] | "  - \(.source) (\(.trust)) at \(.at | todate)"' 2>/dev/null || echo "  $custody_chain"
 
     # Check if quarantined
-    local qcount=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM quarantine WHERE content_id = '$id'")
+    local qcount=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM quarantine WHERE content_id = '$esc_id'")
     if [ "$qcount" -gt 0 ]; then
         echo ""
         echo "WARNING: This content is quarantined"
-        sqlite3 "$DB_PATH" "SELECT '  Reason: ' || reason || ' (at ' || datetime(quarantined_at, 'unixepoch') || ')' FROM quarantine WHERE content_id = '$id'"
+        sqlite3 "$DB_PATH" "SELECT '  Reason: ' || reason || ' (at ' || datetime(quarantined_at, 'unixepoch') || ')' FROM quarantine WHERE content_id = '$esc_id'"
     fi
 }
 
@@ -206,15 +215,16 @@ cmd_trust_policy() {
             esac
 
             local now=$(date +%s)
+            local esc_pattern=$(sql_escape "$pattern")
 
             # Check if pattern already exists
-            local existing=$(sqlite3 "$DB_PATH" "SELECT id FROM policies WHERE pattern = '$pattern' LIMIT 1")
+            local existing=$(sqlite3 "$DB_PATH" "SELECT id FROM policies WHERE pattern = '$esc_pattern' LIMIT 1")
 
             if [ -n "$existing" ]; then
-                sqlite3 "$DB_PATH" "UPDATE policies SET trust_level = '$trust_level' WHERE pattern = '$pattern'"
+                sqlite3 "$DB_PATH" "UPDATE policies SET trust_level = '$trust_level' WHERE pattern = '$esc_pattern'"
                 echo "Updated policy: $pattern -> $trust_level"
             else
-                sqlite3 "$DB_PATH" "INSERT INTO policies (pattern, trust_level, created_at) VALUES ('$pattern', '$trust_level', $now)"
+                sqlite3 "$DB_PATH" "INSERT INTO policies (pattern, trust_level, created_at) VALUES ('$esc_pattern', '$trust_level', $now)"
                 echo "Added policy: $pattern -> $trust_level"
             fi
 
@@ -229,14 +239,15 @@ cmd_trust_policy() {
                 return 1
             fi
 
-            local count=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM policies WHERE pattern = '$pattern'")
+            local esc_pattern=$(sql_escape "$pattern")
+            local count=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM policies WHERE pattern = '$esc_pattern'")
 
             if [ "$count" -eq 0 ]; then
                 echo "No policy found matching: $pattern"
                 return 1
             fi
 
-            sqlite3 "$DB_PATH" "DELETE FROM policies WHERE pattern = '$pattern'"
+            sqlite3 "$DB_PATH" "DELETE FROM policies WHERE pattern = '$esc_pattern'"
             echo "Removed policy: $pattern"
 
             log_audit "policy_remove" "" "pattern=$pattern"
@@ -282,8 +293,10 @@ cmd_quarantine() {
         return 1
     fi
 
+    local esc_id=$(sql_escape "$id")
+
     # Check if content exists
-    local exists=$(sqlite3 "$DB_PATH" "SELECT id FROM content WHERE id = '$id' LIMIT 1")
+    local exists=$(sqlite3 "$DB_PATH" "SELECT id FROM content WHERE id = '$esc_id' LIMIT 1")
 
     if [ -z "$exists" ]; then
         echo "Error: No provenance record for '$id'"
@@ -292,7 +305,7 @@ cmd_quarantine() {
     fi
 
     # Check if already quarantined
-    local already=$(sqlite3 "$DB_PATH" "SELECT id FROM quarantine WHERE content_id = '$id' LIMIT 1")
+    local already=$(sqlite3 "$DB_PATH" "SELECT id FROM quarantine WHERE content_id = '$esc_id' LIMIT 1")
 
     if [ -n "$already" ]; then
         echo "Content '$id' is already quarantined"
@@ -301,9 +314,10 @@ cmd_quarantine() {
 
     local now=$(date +%s)
     local reason_text="${reason:-No reason provided}"
+    local esc_reason=$(sql_escape "$reason_text")
 
-    sqlite3 "$DB_PATH" "INSERT INTO quarantine (content_id, reason, quarantined_at) VALUES ('$id', '$(echo "$reason_text" | sed "s/'/''/g")', $now)"
-    sqlite3 "$DB_PATH" "UPDATE content SET trust_level = 'untrusted' WHERE id = '$id'"
+    sqlite3 "$DB_PATH" "INSERT INTO quarantine (content_id, reason, quarantined_at) VALUES ('$esc_id', '$esc_reason', $now)"
+    sqlite3 "$DB_PATH" "UPDATE content SET trust_level = 'untrusted' WHERE id = '$esc_id'"
 
     echo "Quarantined '$id': $reason_text"
 
@@ -344,7 +358,8 @@ cmd_verify_trust() {
         return 1
     fi
 
-    local result=$(sqlite3 -separator '|' "$DB_PATH" "SELECT source, trust_level FROM content WHERE id = '$id'")
+    local esc_id=$(sql_escape "$id")
+    local result=$(sqlite3 -separator '|' "$DB_PATH" "SELECT source, trust_level FROM content WHERE id = '$esc_id'")
 
     if [ -z "$result" ]; then
         echo "UNKNOWN: No provenance record for '$id'"
@@ -354,7 +369,7 @@ cmd_verify_trust() {
     IFS='|' read -r source trust_level <<< "$result"
 
     # Check quarantine first
-    local qcount=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM quarantine WHERE content_id = '$id'")
+    local qcount=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM quarantine WHERE content_id = '$esc_id'")
     if [ "$qcount" -gt 0 ]; then
         echo "FAIL: Content is quarantined"
         return 1
